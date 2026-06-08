@@ -4,6 +4,7 @@ import json
 import time
 import threading
 import queue
+import gc
 from datetime import datetime, timedelta
 from typing import List, Dict, Deque
 from collections import deque, defaultdict
@@ -18,6 +19,9 @@ from shared.models import (
 )
 from sentiment.finbert_analyzer import SentimentAnalyzer
 from shared.utils import calculate_rolling_correlation
+from streaming.backpressure_controller import (
+    BackpressureController, SlidingWindowIncrementalAggregator
+)
 
 
 class StreamDataStore:
@@ -87,88 +91,163 @@ class StreamDataStore:
         return [p.price for p in recent]
 
 
-class PythonStreamProcessor:
+class OptimizedPythonStreamProcessor:
     def __init__(self, data_store: StreamDataStore, use_mock_sentiment: bool = True):
         self.data_store = data_store
         self.analyzer = SentimentAnalyzer(use_mock=use_mock_sentiment)
         self.running = False
-        self.news_queue: queue.Queue = queue.Queue()
-        self.price_queue: queue.Queue = queue.Queue()
-        self.orderbook_queue: queue.Queue = queue.Queue()
+        
+        self.news_queue: queue.Queue = queue.Queue(maxsize=20000)
+        self.price_queue: queue.Queue = queue.Queue(maxsize=5000)
+        self.orderbook_queue: queue.Queue = queue.Queue(maxsize=1000)
+        
         self.processed_count = 0
-        self.last_window_time = datetime.now()
-        self.sentiment_buffer: Dict[str, List[SentimentResult]] = defaultdict(list)
+        
+        self.backpressure = BackpressureController(
+            max_queue_size=10000,
+            target_lag_seconds=5.0,
+            min_sample_rate=0.1,
+            max_sample_rate=1.0
+        )
+        
+        self.window_aggregator = SlidingWindowIncrementalAggregator(
+            window_duration_seconds=settings.WINDOW_DURATION,
+            slide_interval_seconds=settings.SLIDE_DURATION
+        )
+        
+        self._sentiment_buffer: Dict[str, List[SentimentResult]] = defaultdict(list)
+        self._last_stats_print = time.time()
+        self._gc_interval = 300
+        self._last_gc = time.time()
+        
+        self._thread_pool = []
     
     def start(self):
         self.running = True
-        threading.Thread(target=self._process_news_thread, daemon=True).start()
-        threading.Thread(target=self._process_price_thread, daemon=True).start()
-        threading.Thread(target=self._window_aggregation_thread, daemon=True).start()
-        threading.Thread(target=self._signal_generation_thread, daemon=True).start()
-        print("Python Stream Processor started")
+        
+        for i in range(2):
+            t = threading.Thread(target=self._process_news_worker, daemon=True, name=f"NewsWorker-{i}")
+            t.start()
+            self._thread_pool.append(t)
+        
+        t = threading.Thread(target=self._process_price_thread, daemon=True, name="PriceWorker")
+        t.start()
+        self._thread_pool.append(t)
+        
+        t = threading.Thread(target=self._window_aggregation_thread, daemon=True, name="AggWorker")
+        t.start()
+        self._thread_pool.append(t)
+        
+        t = threading.Thread(target=self._signal_generation_thread, daemon=True, name="SignalWorker")
+        t.start()
+        self._thread_pool.append(t)
+        
+        t = threading.Thread(target=self._monitoring_thread, daemon=True, name="Monitor")
+        t.start()
+        self._thread_pool.append(t)
+        
+        print("Optimized Python Stream Processor started with 2 news workers")
     
     def stop(self):
         self.running = False
+        for t in self._thread_pool:
+            t.join(timeout=2.0)
     
     def queue_news(self, news_json: str):
-        self.news_queue.put(news_json)
+        try:
+            self.news_queue.put_nowait(news_json)
+        except queue.Full:
+            self.backpressure.stats.drop_count += 1
     
     def queue_price(self, price_json: str):
-        self.price_queue.put(price_json)
+        try:
+            self.price_queue.put_nowait(price_json)
+        except queue.Full:
+            pass
     
     def queue_orderbook(self, orderbook_json: str):
-        self.orderbook_queue.put(orderbook_json)
+        try:
+            self.orderbook_queue.put_nowait(orderbook_json)
+        except queue.Full:
+            pass
     
-    def _process_news_thread(self):
+    def _process_news_worker(self):
         batch = []
         last_batch_time = time.time()
         
         while self.running:
             try:
-                if not self.news_queue.empty():
-                    news_json = self.news_queue.get(timeout=0.1)
-                    try:
-                        news = NewsArticle.from_json(news_json)
-                        batch.append(news)
-                    except Exception as e:
-                        print(f"Error parsing news: {e}")
+                news_json = self.news_queue.get(timeout=0.05)
+                
+                if not self.backpressure.report_input(time.time()):
+                    continue
+                
+                try:
+                    news = NewsArticle.from_json(news_json)
+                    batch.append(news)
+                except Exception as e:
+                    print(f"Error parsing news: {e}")
+                    self.backpressure.report_processed()
                 
                 current_time = time.time()
-                if len(batch) >= settings.BATCH_SIZE or (current_time - last_batch_time) > 0.5:
+                if len(batch) >= settings.BATCH_SIZE or (current_time - last_batch_time) > 0.1:
                     if batch:
                         results = self.analyzer.analyze_batch(batch)
+                        
                         for result in results:
                             self.data_store.add_sentiment(result)
-                            self.sentiment_buffer[result.symbol].append(result)
-                        self.processed_count += len(batch)
+                            self.window_aggregator.add(
+                                result.symbol,
+                                result.sentiment_score,
+                                result.timestamp.timestamp()
+                            )
+                            self._sentiment_buffer[result.symbol].append(result)
                         
-                        if self.processed_count % 1000 == 0:
-                            print(f"Processed {self.processed_count} news articles")
+                        self.backpressure.report_processed(len(batch))
+                        self.processed_count += len(batch)
                         
                         batch = []
                         last_batch_time = current_time
-                else:
-                    time.sleep(0.01)
-                    
+                
             except queue.Empty:
-                time.sleep(0.01)
+                if batch:
+                    results = self.analyzer.analyze_batch(batch)
+                    for result in results:
+                        self.data_store.add_sentiment(result)
+                        self.window_aggregator.add(
+                            result.symbol,
+                            result.sentiment_score,
+                            result.timestamp.timestamp()
+                        )
+                        self._sentiment_buffer[result.symbol].append(result)
+                    
+                    self.backpressure.report_processed(len(batch))
+                    self.processed_count += len(batch)
+                    
+                    batch = []
+                    last_batch_time = time.time()
+                
+                time.sleep(0.001)
+                
             except Exception as e:
-                print(f"Error in news processing: {e}")
-                time.sleep(1)
+                print(f"Error in news worker: {e}")
+                time.sleep(0.1)
     
     def _process_price_thread(self):
         while self.running:
             try:
-                if not self.price_queue.empty():
-                    price_json = self.price_queue.get(timeout=0.1)
+                batch_size = min(10, self.price_queue.qsize())
+                for _ in range(batch_size):
+                    price_json = self.price_queue.get_nowait()
                     try:
                         price = PriceData.from_json(price_json)
                         self.data_store.add_price(price)
                     except Exception as e:
-                        print(f"Error parsing price: {e}")
+                        pass
                 
-                if not self.orderbook_queue.empty():
-                    orderbook_json = self.orderbook_queue.get(timeout=0.1)
+                batch_size = min(5, self.orderbook_queue.qsize())
+                for _ in range(batch_size):
+                    orderbook_json = self.orderbook_queue.get_nowait()
                     try:
                         ob_data = json.loads(orderbook_json)
                         order_book = OrderBook(
@@ -179,67 +258,46 @@ class PythonStreamProcessor:
                         )
                         self.data_store.add_order_book(order_book)
                     except Exception as e:
-                        print(f"Error parsing orderbook: {e}")
+                        pass
                 
-                time.sleep(0.01)
+                time.sleep(0.02)
+                
             except queue.Empty:
-                time.sleep(0.01)
+                time.sleep(0.02)
             except Exception as e:
                 print(f"Error in price processing: {e}")
                 time.sleep(1)
     
     def _window_aggregation_thread(self):
-        window_duration = timedelta(seconds=settings.WINDOW_DURATION)
-        slide_interval = settings.SLIDE_DURATION
-        
         while self.running:
             try:
-                current_time = datetime.now()
+                current_time = time.time()
                 
-                for symbol in settings.SYMBOLS:
-                    buffer = self.sentiment_buffer.get(symbol, [])
-                    if not buffer:
-                        continue
+                for symbol in self.window_aggregator.get_all_symbols():
+                    agg_data = self.window_aggregator.emit(symbol, current_time)
                     
-                    window_end = current_time
-                    window_start = window_end - window_duration
-                    
-                    window_results = [
-                        s for s in buffer 
-                        if window_start <= s.timestamp <= window_end
-                    ]
-                    
-                    if len(window_results) > 0:
-                        scores = [s.sentiment_score for s in window_results]
-                        avg_sentiment = float(np.mean(scores))
-                        positive_ratio = len([s for s in window_results if s.sentiment_score > 0.1]) / len(window_results)
-                        negative_ratio = len([s for s in window_results if s.sentiment_score < -0.1]) / len(window_results)
-                        
-                        prev_scores = self.data_store.get_sentiment_scores(symbol, limit=20)
-                        if len(prev_scores) > 10:
-                            sentiment_momentum = avg_sentiment - float(np.mean(prev_scores[:10]))
-                        else:
-                            sentiment_momentum = 0.0
-                        
+                    if agg_data:
                         agg = WindowSentimentAggregate(
-                            symbol=symbol,
-                            window_start=window_start,
-                            window_end=window_end,
-                            avg_sentiment=avg_sentiment,
-                            news_count=len(window_results),
-                            positive_ratio=positive_ratio,
-                            negative_ratio=negative_ratio,
-                            sentiment_momentum=sentiment_momentum
+                            symbol=agg_data['symbol'],
+                            window_start=datetime.fromtimestamp(agg_data['window_start']),
+                            window_end=datetime.fromtimestamp(agg_data['window_end']),
+                            avg_sentiment=agg_data['avg_sentiment'],
+                            news_count=agg_data['news_count'],
+                            positive_ratio=agg_data['positive_ratio'],
+                            negative_ratio=agg_data['negative_ratio'],
+                            sentiment_momentum=agg_data['sentiment_momentum']
                         )
                         
                         self.data_store.add_window_aggregate(agg)
-                    
-                    cutoff_time = current_time - timedelta(minutes=5)
-                    self.sentiment_buffer[symbol] = [
-                        s for s in buffer if s.timestamp >= cutoff_time
+                
+                cutoff_time = current_time - 300
+                for symbol in list(self._sentiment_buffer.keys()):
+                    self._sentiment_buffer[symbol] = [
+                        s for s in self._sentiment_buffer[symbol]
+                        if s.timestamp.timestamp() >= cutoff_time
                     ]
                 
-                time.sleep(slide_interval)
+                time.sleep(settings.SLIDE_DURATION)
                 
             except Exception as e:
                 print(f"Error in window aggregation: {e}")
@@ -262,188 +320,25 @@ class PythonStreamProcessor:
             except Exception as e:
                 print(f"Error in signal generation: {e}")
                 time.sleep(1)
+    
+    def _monitoring_thread(self):
+        while self.running:
+            try:
+                current_time = time.time()
+                
+                if current_time - self._last_stats_print > 10:
+                    status = self.backpressure.get_status()
+                    print(f"[Monitor] {status}")
+                    self._last_stats_print = current_time
+                
+                if current_time - self._last_gc > self._gc_interval:
+                    gc.collect()
+                    self._last_gc = current_time
+                
+                time.sleep(5)
+                
+            except Exception as e:
+                pass
 
 
-class SparkStreamProcessor:
-    def __init__(self, data_store: StreamDataStore, use_mock_sentiment: bool = True):
-        self.data_store = data_store
-        self.use_mock_sentiment = use_mock_sentiment
-        self.ssc = None
-        self.running = False
-    
-    def start(self):
-        try:
-            from pyspark import SparkConf, SparkContext
-            from pyspark.streaming import StreamingContext
-            
-            print("Starting Spark Streaming Processor...")
-            
-            conf = SparkConf() \
-                .setMaster(settings.SPARK_MASTER) \
-                .setAppName(settings.SPARK_APP_NAME) \
-                .set("spark.executor.memory", "4g") \
-                .set("spark.driver.memory", "2g")
-            
-            sc = SparkContext(conf=conf)
-            sc.setLogLevel("ERROR")
-            
-            self.ssc = StreamingContext(sc, settings.SLIDE_DURATION)
-            
-            os.makedirs(settings.CHECKPOINT_DIR, exist_ok=True)
-            self.ssc.checkpoint(settings.CHECKPOINT_DIR)
-            
-            self._setup_streaming_pipeline()
-            
-            self.ssc.start()
-            self.running = True
-            print("Spark Streaming started successfully")
-            
-            self.ssc.awaitTermination()
-            
-        except Exception as e:
-            print(f"Spark Streaming not available: {e}")
-            print("Falling back to Python Stream Processor")
-            processor = PythonStreamProcessor(self.data_store, self.use_mock_sentiment)
-            processor.start()
-    
-    def _setup_streaming_pipeline(self):
-        from pyspark.streaming.kafka import KafkaUtils
-        
-        try:
-            kafka_stream = KafkaUtils.createDirectStream(
-                self.ssc,
-                [settings.KAFKA_NEWS_TOPIC],
-                {"metadata.broker.list": settings.KAFKA_BOOTSTRAP_SERVERS}
-            )
-            
-            sentiment_stream = kafka_stream.map(
-                lambda x: self._analyze_news(x[1])
-            )
-            
-            windowed_stream = sentiment_stream.window(
-                settings.WINDOW_DURATION,
-                settings.SLIDE_DURATION
-            )
-            
-            aggregated_stream = windowed_stream.map(
-                lambda x: (x['symbol'], x)
-            ).groupByKey().mapValues(
-                lambda sentiments: self._aggregate_window(sentiments)
-            )
-            
-            aggregated_stream.foreachRDD(
-                lambda rdd: rdd.foreach(
-                    lambda x: self._save_aggregate(x[1])
-                )
-            )
-            
-            signal_stream = aggregated_stream.map(
-                lambda x: self._generate_signal(x[1])
-            ).filter(
-                lambda x: x is not None
-            )
-            
-            signal_stream.foreachRDD(
-                lambda rdd: rdd.foreach(
-                    lambda signal: self._save_signal(signal)
-                )
-            )
-            
-        except Exception as e:
-            print(f"Error setting up streaming pipeline: {e}")
-            raise
-    
-    def _analyze_news(self, news_json: str) -> Dict:
-        from sentiment.finbert_analyzer import analyze_news
-        result_json = analyze_news(news_json, use_mock=self.use_mock_sentiment)
-        return json.loads(result_json)
-    
-    def _aggregate_window(self, sentiments) -> Dict:
-        sentiments_list = list(sentiments)
-        if not sentiments_list:
-            return None
-        
-        scores = [s['sentiment_score'] for s in sentiments_list]
-        symbol = sentiments_list[0]['symbol']
-        
-        return {
-            'symbol': symbol,
-            'avg_sentiment': float(np.mean(scores)),
-            'news_count': len(sentiments_list),
-            'positive_ratio': len([s for s in sentiments_list if s['sentiment_score'] > 0.1]) / len(sentiments_list),
-            'negative_ratio': len([s for s in sentiments_list if s['sentiment_score'] < -0.1]) / len(sentiments_list),
-            'sentiment_momentum': 0.0,
-            'timestamp': datetime.now().isoformat()
-        }
-    
-    def _save_aggregate(self, agg_data: Dict):
-        if not agg_data:
-            return
-        
-        try:
-            agg = WindowSentimentAggregate(
-                symbol=agg_data['symbol'],
-                window_start=datetime.now() - timedelta(seconds=settings.WINDOW_DURATION),
-                window_end=datetime.now(),
-                avg_sentiment=agg_data['avg_sentiment'],
-                news_count=agg_data['news_count'],
-                positive_ratio=agg_data['positive_ratio'],
-                negative_ratio=agg_data['negative_ratio'],
-                sentiment_momentum=agg_data['sentiment_momentum']
-            )
-            self.data_store.add_window_aggregate(agg)
-        except Exception as e:
-            print(f"Error saving aggregate: {e}")
-    
-    def _generate_signal(self, agg_data: Dict) -> Dict:
-        if not agg_data:
-            return None
-        
-        symbol = agg_data['symbol']
-        sentiment_scores = self.data_store.get_sentiment_scores(symbol, limit=settings.CORRELATION_WINDOW)
-        prices = self.data_store.get_price_values(symbol, limit=settings.CORRELATION_WINDOW)
-        
-        correlation = calculate_rolling_correlation(
-            sentiment_scores, prices, settings.CORRELATION_WINDOW
-        )
-        
-        signal_strength = agg_data['avg_sentiment'] * (1 + abs(correlation))
-        
-        if signal_strength >= settings.SIGNAL_THRESHOLD_BUY:
-            signal_type = "BUY"
-        elif signal_strength <= settings.SIGNAL_THRESHOLD_SELL:
-            signal_type = "SELL"
-        else:
-            return None
-        
-        return {
-            'symbol': symbol,
-            'signal': signal_type,
-            'strength': abs(signal_strength),
-            'sentiment_score': agg_data['avg_sentiment'],
-            'price_correlation': correlation,
-            'timestamp': datetime.now().isoformat(),
-            'confidence': min(abs(signal_strength), 1.0),
-            'reason': f"Sentiment {agg_data['avg_sentiment']:.3f}, Correlation {correlation:.3f}"
-        }
-    
-    def _save_signal(self, signal_data: Dict):
-        try:
-            signal = TradingSignal(
-                symbol=signal_data['symbol'],
-                signal=signal_data['signal'],
-                strength=signal_data['strength'],
-                sentiment_score=signal_data['sentiment_score'],
-                price_correlation=signal_data['price_correlation'],
-                timestamp=datetime.fromisoformat(signal_data['timestamp']),
-                confidence=signal_data['confidence'],
-                reason=signal_data['reason']
-            )
-            self.data_store.add_trading_signal(signal)
-        except Exception as e:
-            print(f"Error saving signal: {e}")
-    
-    def stop(self):
-        if self.ssc:
-            self.ssc.stop(stopSparkContext=True, stopGraceFully=True)
-        self.running = False
+PythonStreamProcessor = OptimizedPythonStreamProcessor

@@ -18,6 +18,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.settings import settings
 from shared.models import SentimentResult, PriceData, TradingSignal, OrderBook
 from streaming.spark_processor import StreamDataStore, PythonStreamProcessor
+from visualization.render_optimizer import (
+    RenderThrottler, IncrementalHeatmapData, 
+    DataDownsampler, SmartDeltaUpdater,
+    FrameRateLimiter, optimize_plotly_figure
+)
 
 
 class WebSocketClient:
@@ -68,7 +73,7 @@ class WebSocketClient:
         self.running = False
 
 
-def plot_sentiment_timeseries(data_store: StreamDataStore, selected_symbols: List[str]):
+def plot_sentiment_timeseries(data_store: StreamDataStore, selected_symbols: List[str], max_points: int = 100):
     fig = go.Figure()
     
     colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
@@ -78,16 +83,23 @@ def plot_sentiment_timeseries(data_store: StreamDataStore, selected_symbols: Lis
         window_aggs = list(data_store.window_aggregates.get(symbol, []))
         
         if window_aggs:
-            timestamps = [agg.window_end for agg in window_aggs]
+            timestamps = [agg.window_end.timestamp() for agg in window_aggs]
             sentiments = [agg.avg_sentiment for agg in window_aggs]
             
-            fig.add_trace(go.Scatter(
-                x=timestamps,
+            if len(timestamps) > max_points:
+                timestamps, sentiments = DataDownsampler.downsample_time_series(
+                    timestamps, sentiments, target_points=max_points
+                )
+            
+            timestamps_dt = [datetime.fromtimestamp(ts) for ts in timestamps]
+            
+            fig.add_trace(go.Scattergl(
+                x=timestamps_dt,
                 y=sentiments,
-                mode='lines+markers',
+                mode='lines',
                 name=symbol,
                 line=dict(color=colors[i % len(colors)], width=2),
-                marker=dict(size=6)
+                hovertemplate=f"{symbol}: " + "%{y:.3f}<extra></extra>"
             ))
     
     fig.add_hline(y=settings.SIGNAL_THRESHOLD_BUY, line_dash="dash", 
@@ -103,67 +115,111 @@ def plot_sentiment_timeseries(data_store: StreamDataStore, selected_symbols: Lis
         yaxis_range=[-1, 1],
         height=400,
         hovermode='x unified',
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        uirevision='constant'
     )
     
     return fig
 
 
-def plot_signal_heatmap(data_store: StreamDataStore, selected_symbols: List[str]):
-    all_signals = data_store.get_all_signals(limit=200)
-    signals_by_symbol = {}
+def plot_signal_heatmap(
+    data_store: StreamDataStore,
+    selected_symbols: List[str],
+    incremental_data: IncrementalHeatmapData = None,
+    throttler: RenderThrottler = None
+):
+    if throttler and not throttler.should_render():
+        return None
     
-    for symbol in selected_symbols:
-        symbol_signals = [s for s in all_signals if s.symbol == symbol]
-        signals_by_symbol[symbol] = symbol_signals
+    if incremental_data is not None:
+        all_signals = data_store.get_all_signals(limit=200)
+        for signal in all_signals:
+            if signal.symbol in selected_symbols:
+                value = signal.strength if signal.signal == 'BUY' else -signal.strength
+                incremental_data.update(
+                    signal.symbol,
+                    signal.timestamp.timestamp(),
+                    value,
+                    {'count': 1}
+                )
+        
+        if not incremental_data.needs_update():
+            return None
+        
+        heatmap_data, symbols, buckets, dirty, text_data = incremental_data.get_heatmap_data()
+        
+        if heatmap_data.shape[0] == 0 or heatmap_data.shape[1] == 0:
+            fig = go.Figure()
+            fig.add_annotation(text="Waiting for signal data...", showarrow=False, font=dict(size=16))
+            fig.update_layout(height=400, title='Trading Signal Strength Heatmap')
+            return fig
+        
+        if heatmap_data.shape[1] > 15:
+            heatmap_data, _ = DataDownsampler.downsample_heatmap(heatmap_data, target_buckets=15)
+            buckets = buckets[::max(1, len(buckets) // 15)]
+            text_data = [row[::max(1, len(row) // 15)] for row in text_data]
     
-    time_buckets = []
-    now = datetime.now()
-    for i in range(20):
-        bucket_start = now - timedelta(minutes=(20 - i) * 2)
-        time_buckets.append(bucket_start)
-    
-    heatmap_data = np.zeros((len(selected_symbols), len(time_buckets)))
-    text_data = [[None for _ in range(len(time_buckets))] for _ in range(len(selected_symbols))]
-    
-    for i, symbol in enumerate(selected_symbols):
-        for j, bucket_time in enumerate(time_buckets):
-            next_bucket = bucket_time + timedelta(minutes=2)
-            bucket_signals = [
-                s for s in signals_by_symbol.get(symbol, [])
-                if bucket_time <= s.timestamp < next_bucket
-            ]
-            
-            if bucket_signals:
-                avg_strength = np.mean([s.strength for s in bucket_signals])
-                signal_types = [s.signal for s in bucket_signals]
-                if 'BUY' in signal_types and 'SELL' in signal_types:
-                    heatmap_data[i, j] = avg_strength if 'BUY' in signal_types else -avg_strength
-                elif 'BUY' in signal_types:
-                    heatmap_data[i, j] = avg_strength
-                elif 'SELL' in signal_types:
-                    heatmap_data[i, j] = -avg_strength
+    else:
+        all_signals = data_store.get_all_signals(limit=100)
+        signals_by_symbol = {}
+        
+        for symbol in selected_symbols:
+            symbol_signals = [s for s in all_signals if s.symbol == symbol]
+            signals_by_symbol[symbol] = symbol_signals
+        
+        time_buckets = []
+        now = datetime.now()
+        for i in range(15):
+            bucket_start = now - timedelta(minutes=(15 - i) * 2)
+            time_buckets.append(bucket_start)
+        
+        heatmap_data = np.zeros((len(selected_symbols), len(time_buckets)))
+        text_data = [['' for _ in range(len(time_buckets))] for _ in range(len(selected_symbols))]
+        buckets = time_buckets
+        symbols = selected_symbols
+        
+        for i, symbol in enumerate(selected_symbols):
+            for j, bucket_time in enumerate(time_buckets):
+                next_bucket = bucket_time + timedelta(minutes=2)
+                bucket_signals = [
+                    s for s in signals_by_symbol.get(symbol, [])
+                    if bucket_time <= s.timestamp < next_bucket
+                ]
                 
-                text_data[i][j] = f"{len(bucket_signals)} signals<br>Avg: {avg_strength:.2f}"
+                if bucket_signals:
+                    avg_strength = np.mean([s.strength for s in bucket_signals])
+                    signal_types = [s.signal for s in bucket_signals]
+                    if 'BUY' in signal_types and 'SELL' in signal_types:
+                        heatmap_data[i, j] = avg_strength if 'BUY' in signal_types else -avg_strength
+                    elif 'BUY' in signal_types:
+                        heatmap_data[i, j] = avg_strength
+                    elif 'SELL' in signal_types:
+                        heatmap_data[i, j] = -avg_strength
+                    
+                    text_data[i][j] = f"{len(bucket_signals)} signals<br>Avg: {avg_strength:.2f}"
+    
+    x_labels = [datetime.fromtimestamp(b).strftime("%H:%M") if isinstance(b, (int, float)) else b.strftime("%H:%M") for b in buckets]
     
     fig = go.Figure(data=go.Heatmap(
         z=heatmap_data,
-        x=[tb.strftime("%H:%M") for tb in time_buckets],
-        y=selected_symbols,
+        x=x_labels,
+        y=symbols,
         colorscale='RdYlGn',
         zmid=0,
         zmin=-1,
         zmax=1,
         text=text_data,
         hovertemplate='Symbol: %{y}<br>Time: %{x}<br>%{text}<extra></extra>',
-        colorbar=dict(title='Signal Strength<br>(+Buy / -Sell)')
+        colorbar=dict(title='Signal Strength<br>(+Buy / -Sell)'),
+        showscale=True
     ))
     
     fig.update_layout(
         title='Trading Signal Strength Heatmap',
         xaxis_title='Time Bucket (2 min intervals)',
         yaxis_title='Symbol',
-        height=400
+        height=400,
+        uirevision='constant'
     )
     
     return fig
@@ -340,10 +396,23 @@ def main():
         st.session_state.processor.start()
         st.session_state.ws_client = WebSocketClient(st.session_state.data_store, st.session_state.processor)
         st.session_state.ws_client.start()
+        
+        st.session_state.heatmap_throttler = RenderThrottler(max_fps=2.0)
+        st.session_state.chart_throttler = RenderThrottler(max_fps=2.0)
+        st.session_state.incremental_heatmap = IncrementalHeatmapData(max_time_buckets=15, max_symbols=10)
+        st.session_state.delta_updater = SmartDeltaUpdater(tolerance=0.01)
+        st.session_state.fps_limiter = FrameRateLimiter(target_fps=2.0)
+        st.session_state._last_heatmap_fig = None
+        
         st.success("Streaming system initialized!")
     
     data_store = st.session_state.data_store
     processor = st.session_state.processor
+    
+    heatmap_throttler = st.session_state.heatmap_throttler
+    chart_throttler = st.session_state.chart_throttler
+    incremental_heatmap = st.session_state.incremental_heatmap
+    fps_limiter = st.session_state.fps_limiter
     
     from signal.signal_generator import SignalExecutor
     if 'executor' not in st.session_state:
@@ -402,8 +471,22 @@ def main():
         display_signals_table(data_store)
     
     with tab2:
-        fig_heatmap = plot_signal_heatmap(data_store, selected_symbols)
-        st.plotly_chart(fig_heatmap, use_container_width=True)
+        fig_heatmap = plot_signal_heatmap(
+            data_store, selected_symbols,
+            incremental_data=incremental_heatmap,
+            throttler=heatmap_throttler
+        )
+        
+        if fig_heatmap is not None:
+            st.session_state._last_heatmap_fig = fig_heatmap
+            st.plotly_chart(fig_heatmap, use_container_width=True)
+        elif st.session_state._last_heatmap_fig is not None:
+            st.plotly_chart(st.session_state._last_heatmap_fig, use_container_width=True)
+        else:
+            fig = go.Figure()
+            fig.add_annotation(text="Waiting for signal data...", showarrow=False, font=dict(size=16))
+            fig.update_layout(height=400, title='Trading Signal Strength Heatmap')
+            st.plotly_chart(fig, use_container_width=True)
         
         st.caption("Green indicates buy signals, red indicates sell signals. Intensity shows signal strength.")
     
@@ -487,7 +570,9 @@ def main():
     
     executor.process_signals()
     
-    time.sleep(settings.STREAMLIT_UPDATE_INTERVAL)
+    actual_fps = fps_limiter.wait_for_next_frame()
+    
+    time.sleep(max(0, settings.STREAMLIT_UPDATE_INTERVAL - fps_limiter.min_frame_time))
     st.rerun()
 
 
